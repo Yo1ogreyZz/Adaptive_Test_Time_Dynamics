@@ -1,1 +1,2 @@
-# Adaptive-Test-Time-Dynamics-Jointly-Optimizing-What-and-How-Much-to-Adapt
+# Adaptive Test Time Dynamics
+> Jointly Optimizing What and How Much to Adapt
