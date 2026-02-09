@@ -16,8 +16,8 @@ class LowRankAdapter(nn.Module):
 
         factory_kwargs = {"device": device, "dtype": dtype}
         # Small init so the initial perturbation is near zero
-        self.U = nn.Parameter(torch.randn(d_inner, rank, **factory_kwargs) * 0.001)
-        self.V = nn.Parameter(torch.randn(rank, d_state, **factory_kwargs) * 0.001)
+        self.U = nn.Parameter(torch.zeros(d_inner, rank, **factory_kwargs))
+        self.V = nn.Parameter(torch.zeros(rank, d_state, **factory_kwargs))
 
     def forward(self):
         """Return delta_A of shape (d_inner, d_state)."""
@@ -25,8 +25,8 @@ class LowRankAdapter(nn.Module):
 
     def reset_parameters(self):
         """Re-initialize for instance-specific adaptation (called per sample)."""
-        nn.init.normal_(self.U, std=0.001)
-        nn.init.normal_(self.V, std=0.001)
+        nn.init.zeros_(self.U)
+        nn.init.zeros_(self.V)
 
 
 class StabilityGate(nn.Module):
@@ -51,10 +51,20 @@ class StabilityGate(nn.Module):
         Returns:
             gamma: scalar in [0, 1]
         """
+        dev = next(self.parameters()).device
+
         if not isinstance(loss_val, torch.Tensor):
-            loss_val = torch.tensor([[loss_val]], dtype=torch.float32)
+            loss_val = torch.tensor(loss_val, device=dev, dtype=torch.float32)
+        else:
+            loss_val = loss_val.to(device=dev, dtype=torch.float32)
+
         if loss_val.dim() == 0:
-            loss_val = loss_val.unsqueeze(0).unsqueeze(0)
-        if loss_val.dim() == 1:
-            loss_val = loss_val.unsqueeze(0)
+            loss_val = loss_val.view(1, 1)
+        elif loss_val.dim() == 1:
+            loss_val = loss_val.view(-1, 1)
+        elif loss_val.dim() == 2:
+            pass
+        else: 
+            raise ValueError(f"loss_val must be scalar/1D/2D tensor, got shape {tuple(loss_val.shape)}")
+
         return self.gate(loss_val)
