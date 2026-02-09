@@ -1,7 +1,10 @@
+import os
 import torch
 from torch.utils.data import DataLoader
-from datasets import load_dataset
+from datasets import load_from_disk
 from tqdm import tqdm
+
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 
 
 class LRATask:
@@ -16,8 +19,12 @@ class LRATask:
         self.max_length = max_length
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        print(f"Loading LRA task: {task_name}...")
-        self.dataset = load_dataset("long-range-arena/" + task_name)
+        dataset_path = os.path.join(DATA_DIR, task_name)
+        if not os.path.isdir(dataset_path):
+            raise ValueError(f"Dataset not found at {dataset_path}")
+
+        print(f"Loading LRA task: {task_name} (from {dataset_path})...")
+        self.dataset = load_from_disk(dataset_path)
 
     def get_dataloader(self, split="train"):
         return DataLoader(

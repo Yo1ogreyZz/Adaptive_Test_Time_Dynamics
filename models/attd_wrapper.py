@@ -36,9 +36,6 @@ class ATTDWrapper(nn.Module):
         self.stability_gate = StabilityGate()
         self.inner_lr = config.get("inner_lr", 1e-3)
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
     def _get_delta_As(self):
         """Compute delta_A from every layer's adapter."""
@@ -53,9 +50,6 @@ class ATTDWrapper(nn.Module):
         """Collect all adapter parameters into a single list."""
         return [p for adapter in self.adapters for p in adapter.parameters()]
 
-    # ------------------------------------------------------------------
-    # Inner loop
-    # ------------------------------------------------------------------
 
     def compute_internal_loss(self, x, delta_As):
         """
@@ -91,6 +85,9 @@ class ATTDWrapper(nn.Module):
                 loss = self.compute_internal_loss(x, delta_As)
                 loss.backward()
 
+                if (_+1) % 1 == 0:
+                    print(f"[ATTD] Step {_ + 1}/{k_dyn}, Inner Loss: {loss.item():.4f}")
+                    
                 # Scale gradients by stability gate
                 gamma = self.stability_gate(loss.detach())
                 for p in self._adapter_parameters():
@@ -104,9 +101,6 @@ class ATTDWrapper(nn.Module):
 
         return [adapter().detach() for adapter in self.adapters]
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
 
     def forward(self, x):
         """

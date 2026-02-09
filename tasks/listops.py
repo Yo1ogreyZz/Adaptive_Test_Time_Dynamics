@@ -16,7 +16,7 @@ class ListOpsTask(LRATask):
             "0": 5, "1": 6, "2": 7, "3": 8, "4": 9,
             "5": 10, "6": 11, "7": 12, "8": 13, "9": 14,
             "MAX": 15, "MIN": 16, "MED": 17, "FIRST": 18,
-            "LAST": 19, "SUM_MOD": 20,
+            "LAST": 19, "SM": 20,
         }
         self.vocab_size = len(self.vocab)
         self.num_classes = 10
