@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
 
 class MonotonicController(nn.Module):
     """
@@ -10,15 +10,20 @@ class MonotonicController(nn.Module):
     Uses Straight-Through Estimator (STE) for gradient flow.
     """
 
-    def __init__(self, k_max=5):
+    def __init__(self, k_max=5, tau=0.1, init_scale=0.2):
         super().__init__()
         self.k_max = k_max
-        # Learnable thresholds, initialized as a linearly spaced sequence
-        self.threshold_raw = nn.Parameter(torch.linspace(-1.0, 1.0, k_max))
+        
+        self.tau = tau
+        self.delta_raw = nn.Parameter(torch.full((k_max,), init_scale))
+
+        self.t0 = nn.Parameter(torch.tensor(0.0))
 
     def get_thresholds(self):
         """Return monotonically increasing thresholds via sorting."""
-        return torch.sort(self.threshold_raw)[0]
+        inc = F.softplus(self.delta_raw)
+        t = self.t0 + torch.cumsum(inc, dim=0)
+        return t
 
     def forward(self, ponder_signal):
         """
@@ -29,18 +34,27 @@ class MonotonicController(nn.Module):
         """
         thresholds = self.get_thresholds()
 
+        dev = next(self.parameters()).device
+        if not isinstance(ponder_signal, torch.Tensor):
+            ponder_signal = torch.tensor(ponder_signal, device=dev, dtype=torch.float32)
+        else:
+            ponder_signal = ponder_signal.to(device=dev, dtype=torch.float32)
+
         if ponder_signal.dim() == 0:
-            ponder_signal = ponder_signal.unsqueeze(0)
+            ponder_signal = ponder_signal.view(1)
 
         # (B, 1) vs (k_max,) -> broadcast comparison
         s = ponder_signal.unsqueeze(-1)
 
         # Hard indicator (forward) with soft gradient (backward) via STE
-        indicator = (s > thresholds).float()
-        soft = torch.sigmoid(s - thresholds)
-        ste_indicator = indicator + (soft - soft.detach())
+        soft = torch.sigmoid((s - thresholds) / self.tau)
+        hard = (soft > 0.5).float
+        gates = hard.detach() - soft.detach() + soft
 
-        return torch.sum(ste_indicator, dim=-1)
+        K_soft = gates.sum(dim=-1)
+        K_hard = hard.sum(dim=-1).long()
+
+        return K_soft, K_hard, gates, thresholds
 
 
 class PonderSignalProcessor(nn.Module):
