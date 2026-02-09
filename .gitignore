@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+
+*.pbs
+*.o[0-9]*
+*.e[0-9]*
+
+*.log
+wandb/
+
+*.pt
+*.ckpt
+
+.vscode/
+.idea/

@@ -1,0 +1,62 @@
+{
+  "builder_name": "parquet",
+  "citation": "",
+  "config_name": "default",
+  "dataset_name": "listops-64",
+  "dataset_size": 11951168,
+  "description": "",
+  "download_checksums": {
+    "hf://datasets/fengyang0317/listops-64@b48d4e96f3e84b4dbaa60b6623e08dd7e86b8347/data/train-00000-of-00001.parquet": {
+      "num_bytes": 5370358,
+      "checksum": null
+    },
+    "hf://datasets/fengyang0317/listops-64@b48d4e96f3e84b4dbaa60b6623e08dd7e86b8347/data/validation-00000-of-00001.parquet": {
+      "num_bytes": 112979,
+      "checksum": null
+    },
+    "hf://datasets/fengyang0317/listops-64@b48d4e96f3e84b4dbaa60b6623e08dd7e86b8347/data/test-00000-of-00001.parquet": {
+      "num_bytes": 112811,
+      "checksum": null
+    }
+  },
+  "download_size": 5596148,
+  "features": {
+    "Source": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "Target": {
+      "dtype": "int64",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": "",
+  "size_in_bytes": 17547316,
+  "splits": {
+    "train": {
+      "name": "train",
+      "num_bytes": 11471906,
+      "num_examples": 96000,
+      "dataset_name": "listops-64"
+    },
+    "validation": {
+      "name": "validation",
+      "num_bytes": 239788,
+      "num_examples": 2000,
+      "dataset_name": "listops-64"
+    },
+    "test": {
+      "name": "test",
+      "num_bytes": 239474,
+      "num_examples": 2000,
+      "dataset_name": "listops-64"
+    }
+  },
+  "version": {
+    "version_str": "0.0.0",
+    "major": 0,
+    "minor": 0,
+    "patch": 0
+  }
+}

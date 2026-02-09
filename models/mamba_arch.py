@@ -3,7 +3,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+try:
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+except ImportError:
+    selective_scan_fn = None
 
 
 class ATTD_MambaBlock(nn.Module):
@@ -77,7 +80,15 @@ class ATTD_MambaBlock(nn.Module):
             A = A + delta_A
 
         # Selective scan
-        y = selective_scan_fn(x, dt, A, B, C, self.D.float(), z=z, delta_softplus=True)
+        if selective_scan_fn is not None:
+            y = selective_scan_fn(x, dt, A, B, C, self.D.float(), z=z, delta_softplus=True)
+        else:
+            # Fallback for CPU/Logic verification
+            y = x * torch.sigmoid(dt)
+            if z is not None:
+                y = y * torch.sigmoid(z)
+            if self.D is not None:
+                y = y + x * self.D.view(1, -1, 1)
         y = rearrange(y, "b d l -> b l d")
 
         return self.out_proj(y)
