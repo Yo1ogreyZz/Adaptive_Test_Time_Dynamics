@@ -1,154 +1,125 @@
 # Adaptive Test-Time Dynamics (ATTD) on Mamba
 
-This repository contains our implementation of **Adaptive Test-Time Dynamics (ATTD)**: a framework that combines **test-time adaptation** with **adaptive computation depth**, instantiated on the **Mamba** architecture.
+This repository contains our DSA5204 project on **Adaptive Test-Time Dynamics (ATTD)**: a framework that combines **test-time adaptation** with **adaptive computation depth**, implemented on the **Mamba** architecture.
 
-------
+***
 
-## 1. What We Are Trying to Do
+## 1. What this project is about
 
-Standard deep models (including Mamba) are usually used with:
+Most models, including Mamba, are used in a simple way at test time:
 
-- **Frozen parameters** at test time
-- **Fixed compute** per input (same depth / cost for all samples)
+- The model parameters are frozen.
+- Every input uses the same amount of compute.
 
-This is problematic when:
+This is wasteful and fragile when:
 
-- The test distribution shifts away from training
-- Some inputs are much harder than others and would benefit from extra computation
+- The test distribution shifts away from training.
+- Some inputs are clearly harder than others and would benefit from more “thinking”.
 
-Our goal is to let the model, at test time:
+ATTD aims to let the model, at test time:
 
-1. **Adapt its internal dynamics** (not all parameters, but a structured subset), and
-2. **Decide how many adaptation steps to take** per input based on difficulty.
+- Adjust a small, structured part of its **dynamics** (instead of all weights).
+- Decide **how many** test-time update steps to run per input based on difficulty.
 
-In other words, ATTD tries to jointly learn:
+In short, we want to learn both:
 
-- *What* to adapt (a low-rank “dynamics adapter” inside Mamba), and
-- *How much* to adapt (an input-dependent number of test-time update steps).
+- *What* to adapt (a small “dynamics adapter” inside Mamba).
+- *How much* to adapt (input-dependent number of update steps).
 
-------
+***
 
-## 2. Model and Method (Conceptual)
+## 2. Core ideas
 
-We work with a Mamba-style **state space model**. Each Mamba block has a state transition matrix $A_0$ that governs the dynamics.
+### Structured dynamics adapter
 
-## 2.1 Structured Dynamics Adapter
+Inside each Mamba block, there is a state transition module that controls how the hidden state evolves. Instead of changing the whole block at test time, we add a small, low-rank “adapter” on top of the original transition. 
 
-Instead of adapting all weights, we introduce a small, low-rank adapter:
-$$
-A_k = A_0 + U_k V_k^\top
-$$
+During normal training, Mamba is trained as usual. At test time, the big backbone stays frozen, and only this small adapter is allowed to change. This gives us:
 
-- $A_0$: fixed base dynamics (learned during training and then frozen at test time)
-- $U_k, V_k$: low-rank factors updated during test-time adaptation (this is our $\psi_k$)
+- A clear target for adaptation: the internal dynamics.
+- A small parameter set, which is easier to control and more stable.
 
-Only $(U_k, V_k)$ are updated at test time, making the adaptation:
+### Ponder signal from an internal loss
 
-- **Structured** (explicitly tied to dynamics)
-- **Lightweight** (few additional parameters)
+For a given test input, we compute an **internal self-supervised loss**, such as:
 
-## 2.2 Ponder Signal (Internal Loss)
+- A language modelling loss on the sequence, or  
+- A reconstruction / consistency loss.
 
-Given a test input $x$, we define an **internal self-supervised loss**:
-$$
-L_{\text{int}}(x; \theta_{\text{base}}, \psi_0)
-$$
-Examples:
+This scalar loss is used as a **difficulty signal** (ponder signal):
 
-- Language modelling loss on the input sequence
-- Reconstruction or consistency loss
+- If the internal loss is low, the current dynamics are already well matched to this input.  
+- If it is high, the model is struggling and might benefit from extra adaptation steps.
 
-We interpret the scalar value
-$$
-s = L_{\text{int}}(x; \theta_{\text{base}}, \psi_0)
-$$
-as a **ponder / difficulty signal**: higher $s$ means the current dynamics do not fit this input well and may need more adaptation.
+### Monotonic controller for adaptation depth
 
-## 2.3 Adaptive Depth Controller
+We then feed this difficulty signal into a very simple controller that outputs an integer “depth”:
 
-We use a simple, **monotonic, threshold-based controller**:
-$$
-K_{\text{dyn}} = C(s) = \sum_{i=1}^{K_{\max}} \mathbf{1}(s > t_i),
-\quad t_1 < t_2 < \dots < t_{K_{\max}}
-$$
+- Easy inputs → small depth (few or zero adaptation steps).  
+- Hard inputs → larger depth (more steps).
 
-- $K_{\text{dyn}}$: number of test-time adaptation steps for this input
-- $\{t_i\}$: learnable thresholds
+The controller is **monotonic by design**: as the difficulty signal increases, the chosen depth never decreases. This matches the intuitive idea that harder inputs should never get less compute than easier ones.
 
-This ensures:
+### Test-time inner loop
 
-- If an input is “easier” (smaller $s$), then $K_{\text{dyn}}$ is smaller
-- If it is “harder” (larger $s$), then $K_{\text{dyn}}$ is larger
+Given the chosen depth:
 
-This is the “how much to adapt” part.
+- We start from an initial version of the dynamics adapter.
+- We run a small number of gradient-based update steps on this adapter, using the internal loss as the objective.
+- After these updates, we keep the backbone fixed, use the adapted dynamics to run Mamba on the input, and produce the final prediction.
 
-## 2.4 Test-Time Inner Loop (Dynamics-Only Adaptation)
+Only the adapter is changed at test time; the backbone weights stay untouched.
 
-Starting from initial dynamics $\psi_0 = (U_0, V_0)$, we run $K_{\text{dyn}}$ gradient steps:
-$$
-\psi_{k+1} = \psi_k - \eta \nabla_{\psi_k} L_{\text{int}}(x; A_k), 
-\quad A_k = A_0 + U_k V_k^\top
-$$
+***
 
-- The base Mamba parameters $\theta_{\text{base}}$ are **not** changed at test time
-- Only $(U_k, V_k)$ are updated according to the internal loss
+## 3. Theoretical intuition
 
-After $K_{\text{dyn}}$ steps, we use the final dynamics $A_{K_{\text{dyn}}}$ to produce the task prediction.
+Our theoretical guide focuses on three questions:
 
-------
+1. **Stability**  
+   Because we only change a low-rank adapter and take small update steps, the change in the internal dynamics is controlled. Together with suitable regularisation on the size of each update, this helps keep the model’s state evolution stable rather than exploding or diverging.
 
-## 3. Training Objective (Theory Basis)
+2. **Reasonable controller behaviour**  
+   The controller is monotonic by construction: harder inputs (higher internal loss) always get at least as much compute as easier inputs. Under natural assumptions like “more adaptation cannot hurt too much” and “benefits of extra steps gradually diminish”, it can be argued that such monotone policies are close to optimal for allocating a fixed compute budget.
 
-During training (on held-out data or a proxy distribution), we optimise a **joint objective**:
-$$
-L_{\text{total}} = 
-\mathbb{E}[L_{\text{task}}]
-+ \lambda \,\mathbb{E}[\text{Cost}(K_{\text{dyn}})]
-+ \beta \,\mathbb{E}\Big[\sum_{k<K_{\text{dyn}}}\|\Delta\psi_k\|^2\Big]
-$$
+3. **Bi-level / meta-learning view**  
+   Conceptually, there is an outer loop that trains the backbone, the initial adapter and the controller, and an inner loop that adapts the adapter at test time. This is similar to ideas from meta-learning and bilevel optimisation (such as MAML), where the outer training takes into account how the model will adapt later.
 
-- $L_{\text{task}}$: main task loss (e.g. classification or sequence loss)
-- $\text{Cost}(K_{\text{dyn}})$: penalises large $K_{\text{dyn}}$ to keep average compute under control
-  - e.g. $\text{Cost}(K_{\text{dyn}}) = K_{\text{dyn}}$ or a convex function of $K_{\text{dyn}}$
-- $\sum\|\Delta\psi_k\|^2$: regularises parameter changes between inner steps, encouraging **stable** dynamics updates
-- $\lambda, \beta$: hyperparameters controlling compute–performance–stability trade-offs
+***
 
-This objective connects to:
+## 4. Relation to existing work
 
-- **PonderTTT / adaptive computation**: cost term encourages economical use of extra compute
-- **TTT / meta-learning / bilevel optimisation**: differentiating through test-time updates
-- **SSM stability theory**: low-rank updates and bounded spectral radius for $A_k$
+ATTD is inspired by and connects to several threads:
 
-------
+- **PonderTTT**: learns when to apply a single TTT update to an LLM, based on a self-supervised signal and a compute budget.  
+- **Test-Time Training (TTT)**: performs self-supervised tuning at test time to handle distribution shift.  
+- **Adaptive computation** (e.g. ACT, PonderNet): learns halting policies and expected depth penalties.  
+- **Structured state space models** (Mamba, HiPPO, S4): provide a dynamics-focused view and tools to reason about stability and long-range behaviour.  
+- **Meta-learning / bilevel methods**: give the formal language for “outer loop training, inner loop adaptation”.
 
-## 4. Theoretical Intuition
+Our twist is to:
 
-The theoretical guide we use focuses on three questions:
+- Make the test-time adaptation explicitly about **dynamics** (inside Mamba), rather than arbitrary weights.  
+- Learn a controller that chooses a **variable number of adaptation steps per input**, rather than just “update or not”.
 
-1. **Stability of dynamics**
-   - Under low-rank updates $A_k = A_0 + U_k V_k^\top$ with small, bounded steps, we can bound how much the spectral radius $\rho(A_k)$ deviates from $\rho(A_0)$.
-   - With appropriate learning rate and regularisation, we expect $\rho(A_k) < 1$ throughout inner-loop adaptation (no exploding dynamics).
-2. **Monotonic controller as a principled policy**
-   - The multi-threshold form of $C(s)$ is monotone by construction.
-   - Under mild assumptions (e.g. loss decreases with more steps but with diminishing returns), an optimal allocation of compute tends to be a monotone function of difficulty, which matches this design.
-3. **Bilevel / meta-learning view**
-   - Outer loop: learns $\theta_{\text{base}}$, thresholds $\{t_i\}$, and possibly initial $\psi_0$.
-   - Inner loop: adapts $\psi$ via test-time updates.
-   - With appropriate smoothness assumptions, gradients through the inner loop are well-defined, connecting to MAML-style analysis.
+***
 
-------
+## 5. Benchmarks
 
-## 5. Benchmarks and Intended Use
+We plan to evaluate ATTD-Mamba on **Long Range Arena (LRA)** tasks:
 
-We plan to test ATTD-Mamba on **Long Range Arena (LRA)** tasks:
-
-- **ListOps** – compositional reasoning on nested lists
-- **Pathfinder** – long-range visual path finding
+- **ListOps** – long-range symbolic/structural reasoning  
+- **Pathfinder** – long-range visual reasoning  
 - **Text** – long-context text modelling
 
-We will compare:
+For each task, we compare:
 
-- Fixed Mamba (no adaptation)
-- Full TTT (same number of steps for all inputs)
-- PonderTTT-style “ponder or not” gating
-- **ATTD-Mamba** (structured dynamics + adaptive depth)
+- Plain Mamba (no test-time adaptation)  
+- Mamba with fixed-number TTT for all inputs  
+- PonderTTT-style “ponder or not” gating  
+- **ATTD-Mamba** with structured dynamics and adaptive depth
+
+The main questions we want to answer are:
+
+- Can ATTD achieve better robustness than fixed Mamba with similar average compute?  
+- Does focusing adaptation on dynamics help stability and performance compared to generic TTT?
