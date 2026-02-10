@@ -13,3 +13,11 @@ wandb/
 
 .vscode/
 .idea/
+
+checkpoints/
+
+tools/
+
+data/listops_small
+
+run_scripts/

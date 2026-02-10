@@ -6,11 +6,11 @@ from .lra_base import LRATask
 class ListOpsTask(LRATask):
     """
     ListOps: classify the result of nested logical operations (0-9).
-    Sequence length: up to 2048 tokens.
+    Actual token lengths are ~50, so max_length=256 is sufficient.
     """
 
-    def __init__(self, batch_size=32, max_length=2048):
-        super().__init__(task_name="listops", batch_size=batch_size, max_length=max_length)
+    def __init__(self, batch_size=32, max_length=256, data_name="listops"):
+        super().__init__(task_name=data_name, batch_size=batch_size, max_length=max_length)
         self.vocab = {
             "<PAD>": 0, "(": 1, ")": 2, "[": 3, "]": 4,
             "0": 5, "1": 6, "2": 7, "3": 8, "4": 9,
@@ -34,24 +34,35 @@ class ListOpsTask(LRATask):
     def preprocess_batch(self, batch):
         input_ids = [self.tokenize(text) for text in batch["Source"]]
         labels = [int(label) for label in batch["Target"]]
+        input_tensor = torch.tensor(input_ids).to(self.device)
+        # Compute mask for non-PAD positions (PAD token id = 0)
+        mask = (input_tensor != 0)
         return (
-            torch.tensor(input_ids).to(self.device),
+            input_tensor,
             torch.tensor(labels).to(self.device),
+            mask,
         )
 
 
 class ListOpsModel(nn.Module):
     """
     Task-specific model: token embedding + ATTD backbone + 10-class head.
+    Uses mean pooling over non-PAD positions for classification.
     """
 
     def __init__(self, backbone, vocab_size, d_model, num_classes=10):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=0)
         self.backbone = backbone
         self.classifier = nn.Linear(d_model, num_classes)
 
-    def forward(self, input_ids):
+    def forward(self, input_ids, mask=None):
         x = self.embedding(input_ids)   # (B, L, D)
         x = self.backbone(x)            # (B, L, D)
-        return self.classifier(x[:, -1, :])
+        if mask is not None:
+            # Mean pooling over non-PAD positions
+            mask_f = mask.unsqueeze(-1).float()             # (B, L, 1)
+            x = (x * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1)  # (B, D)
+        else:
+            x = x.mean(dim=1)
+        return self.classifier(x)

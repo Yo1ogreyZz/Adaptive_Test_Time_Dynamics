@@ -15,9 +15,11 @@ class LowRankAdapter(nn.Module):
         self.rank = rank
 
         factory_kwargs = {"device": device, "dtype": dtype}
-        # Small init so the initial perturbation is near zero
+        # U starts at zero, V at small random so that:
+        # - delta_A = U @ V = 0 (no initial perturbation)
+        # - grad w.r.t. U = grad_delta_A @ V^T != 0 (gradient flows)
         self.U = nn.Parameter(torch.zeros(d_inner, rank, **factory_kwargs))
-        self.V = nn.Parameter(torch.zeros(rank, d_state, **factory_kwargs))
+        self.V = nn.Parameter(torch.randn(rank, d_state, **factory_kwargs) * 0.1)
 
     def forward(self):
         """Return delta_A of shape (d_inner, d_state)."""
@@ -26,7 +28,7 @@ class LowRankAdapter(nn.Module):
     def reset_parameters(self):
         """Re-initialize for instance-specific adaptation (called per sample)."""
         nn.init.zeros_(self.U)
-        nn.init.zeros_(self.V)
+        nn.init.normal_(self.V, std=0.1)
 
 
 class StabilityGate(nn.Module):

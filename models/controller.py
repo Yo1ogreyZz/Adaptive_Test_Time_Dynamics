@@ -48,7 +48,7 @@ class MonotonicController(nn.Module):
 
         # Hard indicator (forward) with soft gradient (backward) via STE
         soft = torch.sigmoid((s - thresholds) / self.tau)
-        hard = (soft > 0.5).float
+        hard = (soft > 0.5).float()
         gates = hard.detach() - soft.detach() + soft
 
         K_soft = gates.sum(dim=-1)

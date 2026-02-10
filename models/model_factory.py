@@ -21,5 +21,6 @@ def build_attd_backbone(config):
         d_state=config.get("d_state", 16),
         d_conv=config.get("d_conv", 4),
         expand=config.get("expand", 2),
+        dropout=config.get("dropout", 0.0),
     )
     return ATTDWrapper(backbone, config)

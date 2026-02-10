@@ -9,19 +9,73 @@ except ImportError:
     selective_scan_fn = None
 
 
+def selective_scan_ref(x, dt, A, B, C, D, z=None, delta_softplus=False):
+    """
+    Pure PyTorch implementation of selective scan (SSM recurrence).
+    Matches the interface of mamba_ssm.selective_scan_fn.
+
+    Args:
+        x:  (B, D, L)   input
+        dt: (B, D, L)   delta (time step)
+        A:  (D, N)       state transition
+        B:  (B, N, L)    input matrix
+        C:  (B, N, L)    output matrix
+        D:  (D,)         skip connection
+        z:  (B, D, L)    gate (optional)
+        delta_softplus: apply softplus to dt
+    Returns:
+        y:  (B, D, L)
+    """
+    B_batch, D_dim, L = x.shape
+    N = A.shape[1]
+
+    if delta_softplus:
+        dt = F.softplus(dt)
+
+    # Discretize: dA = exp(dt * A), dB_x = dt * x * B
+    # dt: (B, D, L) -> (B, D, L, 1)
+    # A:  (D, N)    -> (1, D, 1, N)
+    dA = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(2))  # (B, D, L, N)
+
+    # x * dt: (B, D, L) -> (B, D, L, 1)
+    # B: (B, N, L) -> (B, 1, L, N)
+    dB_x = (dt * x).unsqueeze(-1) * B.permute(0, 2, 1).unsqueeze(1)  # (B, D, L, N)
+
+    # Sequential scan over time
+    h = torch.zeros(B_batch, D_dim, N, device=x.device, dtype=x.dtype)  # (B, D, N)
+    ys = []
+    for t in range(L):
+        h = dA[:, :, t, :] * h + dB_x[:, :, t, :]            # (B, D, N)
+        y_t = (h * C[:, :, t].unsqueeze(1)).sum(-1)           # (B, D)
+        ys.append(y_t)
+
+    y = torch.stack(ys, dim=2)  # (B, D, L)
+
+    # Skip connection
+    if D is not None:
+        y = y + x * D.unsqueeze(0).unsqueeze(-1)
+
+    # Output gate
+    if z is not None:
+        y = y * F.silu(z)
+
+    return y
+
+
 class ATTD_MambaBlock(nn.Module):
     """
     Single Mamba block with ATTD delta_A injection support.
     Dimension flow: d_model -> d_inner -> d_model (via out_proj).
     """
 
-    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, device=None, dtype=None):
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, dropout=0.0, device=None, dtype=None):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
         self.expand = expand
         self.d_inner = int(self.expand * self.d_model)
+        self.drop = nn.Dropout(dropout)
 
         # Input projection (d_model -> 2 * d_inner for x and z branches)
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=False, **factory_kwargs)
@@ -83,15 +137,10 @@ class ATTD_MambaBlock(nn.Module):
         if selective_scan_fn is not None:
             y = selective_scan_fn(x, dt, A, B, C, self.D.float(), z=z, delta_softplus=True)
         else:
-            # Fallback for CPU/Logic verification
-            y = x * torch.sigmoid(dt)
-            if z is not None:
-                y = y * torch.sigmoid(z)
-            if self.D is not None:
-                y = y + x * self.D.view(1, -1, 1)
+            y = selective_scan_ref(x, dt, A, B, C, self.D.float(), z=z, delta_softplus=True)
         y = rearrange(y, "b d l -> b l d")
 
-        return self.out_proj(y)
+        return self.drop(self.out_proj(y))
 
 
 class MambaBackbone(nn.Module):
@@ -104,7 +153,7 @@ class MambaBackbone(nn.Module):
     """
 
     def __init__(self, n_layers, d_model, d_state=16, d_conv=4, expand=2,
-                 device=None, dtype=None):
+                 dropout=0.0, device=None, dtype=None):
         super().__init__()
         self.n_layers = n_layers
         self.d_model = d_model
@@ -114,7 +163,7 @@ class MambaBackbone(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         self.layers = nn.ModuleList([
             ATTD_MambaBlock(d_model, d_state=d_state, d_conv=d_conv,
-                            expand=expand, **factory_kwargs)
+                            expand=expand, dropout=dropout, **factory_kwargs)
             for _ in range(n_layers)
         ])
         self.norms = nn.ModuleList([

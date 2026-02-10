@@ -51,10 +51,6 @@ class ATTDWrapper(nn.Module):
         # Training behavior switch: "base" or "controller"
         self.train_mode = config.get("train_mode", "base")
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
     def _get_delta_As(self):
         """Compute delta_A from every layer's adapter."""
         delta_As = [adapter() for adapter in self.adapters]
@@ -76,9 +72,7 @@ class ATTDWrapper(nn.Module):
         """Collect all adapter parameters into a single list."""
         return [p for adapter in self.adapters for p in adapter.parameters()]
 
-    # ------------------------------------------------------------------
-    # Internal loss
-    # ------------------------------------------------------------------
+
 
     def compute_internal_loss(self, x, delta_As):
         """
@@ -89,9 +83,6 @@ class ATTDWrapper(nn.Module):
         target = x.detach()
         return F.mse_loss(output[:, :-1, :], target[:, 1:, :])
 
-    # ------------------------------------------------------------------
-    # Controller decision
-    # ------------------------------------------------------------------
 
     def _decide_k_dyn(self, s):
         """
@@ -104,59 +95,66 @@ class ATTDWrapper(nn.Module):
         if isinstance(out, (tuple, list)):
             K_soft = out[0]
             K_hard = out[1]
-            k_dyn = int(K_hard.mean().item())
+            k_dyn = int(K_hard.float().mean().item())
             return k_dyn, K_soft
         else:
             k_dyn = int(torch.round(out).mean().item())
             return k_dyn, out
 
-    # ------------------------------------------------------------------
-    # Inner loop (TTT)
-    # ------------------------------------------------------------------
 
     def inner_loop_adapt(self, x, k_dyn: int):
         """
         Test-time inner loop: optimize adapter params on L_int for k_dyn steps.
         Uses damped update controlled by gamma for stability.
+        Wrapped with torch.enable_grad() so it works inside @torch.no_grad() contexts.
         """
         if k_dyn <= 0:
             return None
 
+        adapter_params = self._adapter_parameters()
+
+        # Save and temporarily enable requires_grad for adapter params
+        # (they may have been frozen externally, e.g. during controller training)
+        saved_grad_flags = [p.requires_grad for p in adapter_params]
+        for p in adapter_params:
+            p.requires_grad_(True)
+
         for adapter in self.adapters:
             adapter.train()
 
-        inner_optimizer = torch.optim.SGD(self._adapter_parameters(), lr=self.inner_lr)
+        inner_optimizer = torch.optim.SGD(adapter_params, lr=self.inner_lr)
 
-        for _ in range(k_dyn):
-            inner_optimizer.zero_grad()
-            delta_As = self._get_delta_As()
-            loss = self.compute_internal_loss(x, delta_As)
-            loss.backward()
+        with torch.enable_grad():
+            for _ in range(k_dyn):
+                inner_optimizer.zero_grad()
+                delta_As = self._get_delta_As()
+                loss = self.compute_internal_loss(x, delta_As)
+                loss.backward()
 
-            # Stability gate gamma in [0,1] (use mean as scalar damping)
-            gamma = self.stability_gate(loss.detach())
-            gamma_s = gamma.mean().clamp(0.0, 1.0)
+                # Stability gate gamma in [0,1] (use mean as scalar damping)
+                gamma = self.stability_gate(loss.detach())
+                gamma_s = gamma.mean().clamp(0.0, 1.0)
 
-            # Damped update:
-            #   psi_next = psi - lr * grad
-            #   psi <- (1-gamma)*psi + gamma*psi_next
-            with torch.no_grad():
-                for group in inner_optimizer.param_groups:
-                    lr = group["lr"]
-                    for p in group["params"]:
-                        if p.grad is None:
-                            continue
-                        p_next = p - lr * p.grad
-                        p.copy_((1.0 - gamma_s) * p + gamma_s * p_next)
+                # Damped update:
+                #   psi_next = psi - lr * grad
+                #   psi <- (1-gamma)*psi + gamma*psi_next
+                with torch.no_grad():
+                    for group in inner_optimizer.param_groups:
+                        lr = group["lr"]
+                        for p in group["params"]:
+                            if p.grad is None:
+                                continue
+                            p_next = p - lr * p.grad
+                            p.copy_((1.0 - gamma_s) * p + gamma_s * p_next)
 
         for adapter in self.adapters:
             adapter.eval()
 
-        return [adapter().detach() for adapter in self.adapters]
+        # Restore original requires_grad flags
+        for p, flag in zip(adapter_params, saved_grad_flags):
+            p.requires_grad_(flag)
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
+        return [adapter().detach() for adapter in self.adapters]
 
     def forward(self, x, return_info: bool = False):
         """
@@ -167,9 +165,8 @@ class ATTDWrapper(nn.Module):
             - training controller mode: loss (and optionally info)
             - eval: (B, L, D) (and optionally info)
         """
-        # ------------------------------
-        # TRAINING
-        # ------------------------------
+
+
         if self.training:
             if self.train_mode == "controller":
                 # Freeze backbone in controller training mode
@@ -192,9 +189,7 @@ class ATTDWrapper(nn.Module):
             out = self.backbone(x)
             return (out, {}) if return_info else out
 
-        # ------------------------------
-        # EVAL / TEST-TIME
-        # ------------------------------
+
         self._reset_adapters()
 
         with torch.no_grad():
