@@ -37,10 +37,34 @@ class PathfinderModel(nn.Module):
         self.pixel_proj = nn.Linear(1, d_model)
         self.backbone = backbone
         self.classifier = nn.Linear(d_model, num_classes)
+        if hasattr(self.backbone, "set_task_head"):
+            self.backbone.set_task_head(self.classifier)
 
-    def forward(self, pixels):
+    def forward(self, pixels, mask=None, return_info=False):
         # pixels: (B, L) where L = resolution^2
         x = pixels.unsqueeze(-1)        # (B, L, 1)
         x = self.pixel_proj(x)          # (B, L, D)
-        x = self.backbone(x)            # (B, L, D)
-        return self.classifier(x[:, -1, :])
+
+        need_info = return_info or (self.training and getattr(self.backbone, "train_mode", "base") == "controller")
+        out = self.backbone(x, return_info=need_info) if need_info else self.backbone(x)
+
+        info = None
+        if isinstance(out, tuple):
+            x, info = out
+        else:
+            x = out
+
+        if x is None:
+            if hasattr(self.backbone, "backbone"):
+                x = self.backbone.backbone(self.pixel_proj(pixels.unsqueeze(-1)))
+            else:
+                raise RuntimeError("Backbone returned None in PathfinderModel.forward")
+
+        logits = self.classifier(x[:, -1, :])
+
+        if self.training and info is not None and "K_soft" in info:
+            return logits, info["K_soft"]
+
+        if return_info:
+            return logits, (info if info is not None else {})
+        return logits

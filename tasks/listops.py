@@ -55,14 +55,40 @@ class ListOpsModel(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=0)
         self.backbone = backbone
         self.classifier = nn.Linear(d_model, num_classes)
+        # Let backbone access classifier for pseudo-label TTT
+        if hasattr(self.backbone, 'set_task_head'):
+            self.backbone.set_task_head(self.classifier)
 
-    def forward(self, input_ids, mask=None):
+    def _pool(self, x, mask=None):
+        if mask is None:
+            return x.mean(dim=1)
+        mask_f = mask.unsqueeze(-1).float()
+        return (x * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1)
+
+    def forward(self, input_ids, mask=None, return_info=False):
         x = self.embedding(input_ids)   # (B, L, D)
-        x = self.backbone(x)            # (B, L, D)
-        if mask is not None:
-            # Mean pooling over non-PAD positions
-            mask_f = mask.unsqueeze(-1).float()             # (B, L, 1)
-            x = (x * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1)  # (B, D)
+
+        need_info = return_info or (self.training and getattr(self.backbone, "train_mode", "base") == "controller")
+        out = self.backbone(x, return_info=need_info) if need_info else self.backbone(x)
+
+        info = None
+        if isinstance(out, tuple):
+            x, info = out
         else:
-            x = x.mean(dim=1)
-        return self.classifier(x)
+            x = out
+
+        if x is None:
+            if hasattr(self.backbone, "backbone"):
+                x = self.backbone.backbone(self.embedding(input_ids))
+            else:
+                raise RuntimeError("Backbone returned None in ListOpsModel.forward")
+
+        pooled = self._pool(x, mask=mask)
+        logits = self.classifier(pooled)
+
+        if self.training and info is not None and "K_soft" in info:
+            return logits, info["K_soft"]
+
+        if return_info:
+            return logits, (info if info is not None else {})
+        return logits
