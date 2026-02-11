@@ -78,12 +78,17 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW")
     parser.add_argument("--clip_grad", type=float, default=1.0, help="Gradient clipping norm")
+    parser.add_argument("--k_max", type=int, default=5, help="Max ATTD inner-loop steps used at eval when ATTD is enabled")
     parser.add_argument("--no_attd", action="store_true"); parser.add_argument("--train_mode", type=str, default="base"); parser.add_argument("--inner_lr", type=float, default=0.1)
     parser.add_argument("--ckpt_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--resume_weights_only", action="store_true", help="Load model weights only (reset optimizer/epoch/best metrics)")
 
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if args.no_attd and args.train_mode == "controller":
+        raise ValueError("--no_attd is incompatible with --train_mode controller. Controller ablation requires ATTD enabled.")
     
     if args.task in ("listops", "listops_small"):
         task_manager = ListOpsTask(batch_size=args.batch_size, data_name=args.task)
@@ -103,7 +108,7 @@ def main():
         "d_state": 16,
         "expand": 2,
         "rank": 8,
-        "k_max": 5 if not args.no_attd else 0,
+        "k_max": 0 if args.no_attd else args.k_max,
         "inner_lr": args.inner_lr, "train_mode": args.train_mode
     }
 
@@ -114,9 +119,11 @@ def main():
         print(f"Resuming from checkpoint: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device)
         saved_config = ckpt["config"]
-        for key in ["n_layers", "d_model", "d_state", "expand", "rank", "k_max"]:
+        for key in ["n_layers", "d_model", "d_state", "expand", "rank"]:
             if key in saved_config:
                 config[key] = saved_config[key]
+        # Keep runtime knobs from CLI flags (do not inherit these from checkpoint).
+        config["k_max"] = 0 if args.no_attd else args.k_max
         config["train_mode"] = args.train_mode
 
     backbone = build_attd_backbone(config)
@@ -141,14 +148,39 @@ def main():
 
     if ckpt is not None:
         model.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        start_epoch = ckpt["epoch"] + 1
-        best_test_acc = ckpt.get("best_test_acc", 0.0)
-        print(f"Resumed at epoch {start_epoch}, best_test_acc={best_test_acc:.4f}")
+
+        ckpt_args = ckpt.get("args", {})
+        ckpt_train_mode = ckpt_args.get("train_mode", "unknown")
+
+        # Controller ablation typically resumes from a base-model checkpoint.
+        # In that case, keep pretrained weights but restart optimizer/schedule/metrics.
+        if args.train_mode == "controller" and ckpt_train_mode != "controller" and not args.resume_weights_only:
+            print("Detected base -> controller transition; forcing --resume_weights_only for clean controller finetuning.")
+            args.resume_weights_only = True
+
+        if not args.resume_weights_only:
+            try:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                start_epoch = ckpt["epoch"] + 1
+                best_test_acc = ckpt.get("best_test_acc", 0.0)
+                print(f"Resumed full state at epoch {start_epoch}, best_test_acc={best_test_acc:.4f}")
+            except Exception as e:
+                print(f"Warning: failed to load optimizer state ({e}); falling back to weights-only resume.")
+                start_epoch = 0
+                best_test_acc = 0.0
+        else:
+            start_epoch = 0
+            best_test_acc = 0.0
+            print("Resumed weights only: reset epoch to 0 and best_test_acc to 0.0")
 
     # Disable ATTD inner loop at inference (for zero-shot baseline)
     if args.no_attd:
         model.backbone.disable_attd = True
+
+    print(
+        f"Run config: train_mode={args.train_mode}, no_attd={args.no_attd}, "
+        f"k_max={config['k_max']}, inner_lr={config['inner_lr']}, resume_weights_only={args.resume_weights_only}"
+    )
 
     # 5. Training Loop
     train_loader = task_manager.get_dataloader(split="train")
