@@ -108,7 +108,7 @@ def main():
         "d_state": 16,
         "expand": 2,
         "rank": 8,
-        "k_max": 0 if args.no_attd else args.k_max,
+        "k_max": args.k_max,
         "inner_lr": args.inner_lr, "train_mode": args.train_mode
     }
 
@@ -123,7 +123,7 @@ def main():
             if key in saved_config:
                 config[key] = saved_config[key]
         # Keep runtime knobs from CLI flags (do not inherit these from checkpoint).
-        config["k_max"] = 0 if args.no_attd else args.k_max
+        config["k_max"] = args.k_max
         config["train_mode"] = args.train_mode
 
     backbone = build_attd_backbone(config)
@@ -147,7 +147,22 @@ def main():
     best_test_acc = 0.0
 
     if ckpt is not None:
-        model.load_state_dict(ckpt["model_state_dict"])
+        ckpt_state_dict = ckpt["model_state_dict"]
+        try:
+            model.load_state_dict(ckpt_state_dict)
+        except RuntimeError as e:
+            mismatch_msg = "backbone.controller.delta_raw" in str(e)
+            can_skip_controller = args.train_mode != "controller"
+            if mismatch_msg and can_skip_controller:
+                filtered = {k: v for k, v in ckpt_state_dict.items() if not k.startswith("backbone.controller.")}
+                missing, unexpected = model.load_state_dict(filtered, strict=False)
+                print(
+                    "Warning: controller parameter shape mismatch on resume; "
+                    "loaded checkpoint without controller weights "
+                    f"(missing={len(missing)}, unexpected={len(unexpected)})."
+                )
+            else:
+                raise
 
         ckpt_args = ckpt.get("args", {})
         ckpt_train_mode = ckpt_args.get("train_mode", "unknown")
