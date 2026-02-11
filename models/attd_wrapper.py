@@ -40,9 +40,11 @@ class ATTDWrapper(nn.Module):
         self.train_mode = config.get("train_mode", "base")
 
         self._task_head_ref = [None]
+        self._task_head_mode = "sequence_cls"
 
-    def set_task_head(self, task_head):
+    def set_task_head(self, task_head, mode="sequence_cls"):
         self._task_head_ref[0] = task_head
+        self._task_head_mode = mode
 
     @property
     def task_head(self):
@@ -84,6 +86,24 @@ class ATTDWrapper(nn.Module):
         out = self.backbone(x, delta_As=delta_As)
 
         if self.task_head is not None:
+            if self._task_head_mode == "token_lm":
+                token_logits = self.task_head(out)
+                probs = F.softmax(token_logits, dim=-1)
+                ent_per_token = -(probs * torch.log(probs.clamp_min(1e-8))).sum(dim=-1)
+                ent_per = ent_per_token.mean(dim=-1)
+                if ref_logits is not None and self.kl_weight > 0:
+                    kl = F.kl_div(
+                        F.log_softmax(token_logits, dim=-1),
+                        F.softmax(ref_logits, dim=-1),
+                        reduction="batchmean",
+                    )
+                else:
+                    kl = 0.0
+                loss = self.entropy_weight * ent_per.mean() + self.kl_weight * kl
+                if per_sample:
+                    return ent_per
+                return loss
+
             pooled = out.mean(dim=1)
             logits = self.task_head(pooled)
             loss, ent_per = self._classification_ttt_loss(logits, ref_logits=ref_logits)
@@ -120,7 +140,10 @@ class ATTDWrapper(nn.Module):
         if self.task_head is not None:
             with torch.no_grad():
                 out_base = self.backbone(x_orig, delta_As=None)
-                ref_logits = self.task_head(out_base.mean(dim=1))
+                if self._task_head_mode == "token_lm":
+                    ref_logits = self.task_head(out_base)
+                else:
+                    ref_logits = self.task_head(out_base.mean(dim=1))
 
         adapter_params = self._adapter_parameters()
         for p in adapter_params:
