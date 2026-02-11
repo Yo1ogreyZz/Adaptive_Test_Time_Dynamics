@@ -17,6 +17,24 @@ from models.model_factory import build_attd_backbone
 from tasks.listops import ListOpsTask, ListOpsModel
 from tasks.text_cls import TextClsTask, TextClsModel
 from tasks.pathfinder import PathfinderTask, PathfinderModel
+from tasks.lm_wikitext import WikiTextLMTask, WikiTextLMModel
+
+
+def _compute_ce_loss(logits, labels):
+    if logits.dim() == 3 and labels.dim() == 2:
+        return F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1), ignore_index=0)
+    return F.cross_entropy(logits, labels)
+
+
+def _compute_accuracy(logits, labels):
+    if logits.dim() == 3 and labels.dim() == 2:
+        preds = torch.argmax(logits, dim=-1)
+        mask = (labels != 0)
+        correct = ((preds == labels) & mask).sum().item()
+        total = mask.sum().item()
+        return correct, total
+    preds = torch.argmax(logits, dim=-1)
+    return (preds == labels).sum().item(), labels.size(0)
 
 
 def train_one_epoch(model, dataloader, optimizer, criterion, device, clip_grad=1.0):
@@ -35,7 +53,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, clip_grad=1
 
         if is_controller and isinstance(outputs, tuple):
             logits, K_soft = outputs
-            ce_loss = criterion(logits, labels)
+            ce_loss = _compute_ce_loss(logits, labels)
 
             with torch.no_grad():
                 probs = F.softmax(logits, dim=-1)
@@ -49,7 +67,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, clip_grad=1
         else:
             if isinstance(outputs, tuple):
                 outputs = outputs[0]
-            loss = criterion(outputs, labels)
+            loss = _compute_ce_loss(outputs, labels)
             out_for_acc = outputs
 
         loss.backward()
@@ -59,9 +77,9 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, clip_grad=1
 
         total_loss += loss.item()
         num_batches += 1
-        preds = torch.argmax(out_for_acc, dim=-1)
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
+        c, t = _compute_accuracy(out_for_acc, labels)
+        correct += c
+        total += t
 
         pbar.set_postfix(loss=loss.item(), acc=correct / max(total, 1))
 
@@ -87,9 +105,9 @@ def evaluate(model, dataloader, device):
         else:
             logits = outputs
 
-        preds = torch.argmax(logits, dim=-1)
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
+        c, t = _compute_accuracy(logits, labels)
+        correct += c
+        total += t
 
         if isinstance(info, dict):
             if "K_soft" in info and info["K_soft"] is not None:
@@ -116,7 +134,7 @@ def evaluate(model, dataloader, device):
 def main():
     parser = argparse.ArgumentParser(description="Run LRA/ATTD tasks with Mamba")
 
-    parser.add_argument("--task", type=str, default="text", choices=["listops", "listops_small", "text", "pathfinder"])
+    parser.add_argument("--task", type=str, default="text", choices=["listops", "listops_small", "text", "pathfinder", "lm"])
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -143,6 +161,8 @@ def main():
     parser.add_argument("--text_dataset", type=str, default="agnews", choices=["agnews", "imdb"])
     parser.add_argument("--data_dir", type=str, default="data/agnews")
     parser.add_argument("--max_length", type=int, default=512)
+    parser.add_argument("--block_size", type=int, default=256)
+    parser.add_argument("--lm_dataset", type=str, default="wikitext-103-raw-v1")
     parser.add_argument("--num_workers", type=int, default=2)
 
     parser.add_argument("--ckpt_dir", type=str, default="checkpoints")
@@ -171,6 +191,15 @@ def main():
         task_manager = PathfinderTask(batch_size=args.batch_size)
         num_classes = task_manager.num_classes
         vocab_size = None
+    elif args.task == "lm":
+        task_manager = WikiTextLMTask(
+            batch_size=args.batch_size,
+            block_size=args.block_size,
+            dataset_name=args.lm_dataset,
+            data_dir=args.data_dir,
+            num_workers=args.num_workers,
+        )
+        vocab_size, num_classes = task_manager.vocab_size, task_manager.num_classes
     else:
         raise ValueError(f"Unsupported task: {args.task}")
 
@@ -211,6 +240,8 @@ def main():
         model = ListOpsModel(backbone, vocab_size, args.d_model, num_classes)
     elif args.task == "text":
         model = TextClsModel(backbone, vocab_size, args.d_model, num_classes)
+    elif args.task == "lm":
+        model = WikiTextLMModel(backbone, vocab_size, args.d_model)
     else:
         model = PathfinderModel(backbone, args.d_model, num_classes)
 

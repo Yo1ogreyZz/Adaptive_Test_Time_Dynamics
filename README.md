@@ -112,6 +112,8 @@ We plan to evaluate ATTD-Mamba on **Long Range Arena (LRA)** tasks:
 - **Pathfinder** – long-range visual reasoning  
 - **Text** – long-context text modelling
 
+- **WikiText-103 LM** – long-context next-token prediction (byte-level baseline)
+
 For each task, we compare:
 
 - Plain Mamba (no test-time adaptation)  
@@ -123,3 +125,20 @@ The main questions we want to answer are:
 
 - Can ATTD achieve better robustness than fixed Mamba with similar average compute?  
 - Does focusing adaptation on dynamics help stability and performance compared to generic TTT?
+
+
+## Quick start: WikiText-103 LM
+
+Run language-model training with the existing script and new `lm` task mode:
+
+```bash
+python experiments/train.py --task lm --epochs 1 --batch_size 8 --d_model 128 --n_layers 4 --block_size 256
+```
+
+By default this loads `wikitext-103-raw-v1` from HuggingFace `datasets`; you can also point `--data_dir` to local `train.txt/val.txt/test.txt` files.
+
+Download local txt splits to your data directory:
+
+```bash
+python scripts/download_wikitext103.py --output_dir /home/users/nus/e1582377/attd/data/wikitext103
+```
