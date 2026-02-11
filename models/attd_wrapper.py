@@ -104,18 +104,31 @@ class ATTDWrapper(nn.Module):
                 delta_As = self.inner_loop_adapt(x, k_dyn)
                 out = self.backbone(x, delta_As=delta_As)
                 return out, K_soft
-            
+
             out = self.backbone(x)
             return out
-            
+
+        # Skip ATTD inner loop when disabled (zero-shot baseline)
+        if getattr(self, 'disable_attd', False):
+            out = self.backbone(x)
+            if return_info:
+                return out, {"s": 0.0, "k_dyn": 0}
+            return out
+
         self._reset_adapters()
         with torch.no_grad():
             s = self.compute_internal_loss(x, delta_As=None)
-            k_dyn, _ = self._decide_k_dyn(s)
-        
+
+            # In "base" mode the controller is untrained, so use fixed k_max steps.
+            # In "controller" mode the controller has been trained, so use adaptive k.
+            if self.train_mode == "base":
+                k_dyn = self.controller.k_max
+            else:
+                k_dyn, _ = self._decide_k_dyn(s)
+
         delta_As = self.inner_loop_adapt(x, k_dyn)
         out = self.backbone(x, delta_As=delta_As)
-        
+
         if return_info:
             return out, {"s": float(s.detach().item()), "k_dyn": int(k_dyn)}
         return out

@@ -40,7 +40,7 @@ class LRATask:
         total = 0
 
         with torch.no_grad():
-            for batch in tqdm(dataloader, desc=f"Evaluating {self.task_name}"):
+            for batch in tqdm(dataloader, desc=f"Evaluating {self.task_name}", miniters=len(dataloader)//10 or 1):
                 inputs, labels = self.preprocess_batch(batch)
                 outputs = model(inputs)
                 predictions = torch.argmax(outputs, dim=-1)

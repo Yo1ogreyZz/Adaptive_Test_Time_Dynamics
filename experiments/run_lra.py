@@ -24,7 +24,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device):
     total = 0
     num_batches = 0
 
-    pbar = tqdm(dataloader, desc="Training")
+    pbar = tqdm(dataloader, desc="Training", miniters=10)
     is_controller = getattr(model.backbone, "train_mode", "base") == "controller"
     for batch in pbar:
         inputs, labels = batch[0].to(device), batch[1].to(device)
@@ -56,7 +56,7 @@ def evaluate(model, dataloader, device):
     correct = 0
     total = 0
 
-    for batch in tqdm(dataloader, desc="Evaluating"):
+    for batch in tqdm(dataloader, desc="Evaluating", miniters=10):
         inputs, labels = batch[0].to(device), batch[1].to(device)
         mask = batch[2].to(device) if len(batch) > 2 else None
 
@@ -106,18 +106,30 @@ def main():
         "k_max": 5 if not args.no_attd else 0,
         "inner_lr": args.inner_lr, "train_mode": args.train_mode
     }
-    
+
+    # If resuming, restore architecture params from checkpoint but keep
+    # runtime hyperparameters (k_max, inner_lr, train_mode) from CLI args.
+    ckpt = None
+    if args.resume:
+        print(f"Resuming from checkpoint: {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device)
+        saved_config = ckpt["config"]
+        for key in ["n_layers", "d_model", "d_state", "expand", "rank", "k_max"]:
+            if key in saved_config:
+                config[key] = saved_config[key]
+        config["train_mode"] = args.train_mode
+
     backbone = build_attd_backbone(config)
-    
+
     if args.task in ("listops", "listops_small"):
         model = ListOpsModel(backbone, vocab_size, args.d_model, num_classes)
     elif args.task == "text":
         model = TextClsModel(backbone, vocab_size, args.d_model, num_classes)
     elif args.task == "pathfinder":
         model = PathfinderModel(backbone, args.d_model, num_classes)
-        
+
     model.to(device)
-    
+
     if args.train_mode == "controller": optimizer = optim.AdamW(model.backbone.controller.parameters(), lr=args.lr)
     else: optimizer = optim.AdamW(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss()
@@ -127,50 +139,58 @@ def main():
     start_epoch = 0
     best_test_acc = 0.0
 
-    if args.resume:
-        print(f"Resuming from checkpoint: {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device)
+    if ckpt is not None:
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         start_epoch = ckpt["epoch"] + 1
         best_test_acc = ckpt.get("best_test_acc", 0.0)
         print(f"Resumed at epoch {start_epoch}, best_test_acc={best_test_acc:.4f}")
 
+    # Disable ATTD inner loop at inference (for zero-shot baseline)
+    if args.no_attd:
+        model.backbone.disable_attd = True
+
     # 5. Training Loop
     train_loader = task_manager.get_dataloader(split="train")
     test_loader = task_manager.get_dataloader(split="test")
 
-    print(f"Starting training on {args.task} (ATTD: {not args.no_attd})...")
-    for epoch in range(start_epoch, args.epochs):
-        def wrapped_loader(loader):
-            for batch in loader:
-                yield task_manager.preprocess_batch(batch)
+    def wrapped_loader(loader):
+        for batch in loader:
+            yield task_manager.preprocess_batch(batch)
 
-        train_loss, train_acc = train_one_epoch(model, wrapped_loader(train_loader), optimizer, criterion, device)
+    if args.epochs == 0:
+        mode_desc = "zero-shot, ATTD disabled" if args.no_attd else f"ATTD eval, train_mode={args.train_mode}, k_max={config['k_max']}"
+        print(f"Evaluating on {args.task} ({mode_desc})...")
         test_acc = evaluate(model, wrapped_loader(test_loader), device)
+        print(f"Test Acc: {test_acc:.4f}")
+    else:
+        print(f"Starting training on {args.task} (ATTD: {not args.no_attd})...")
+        for epoch in range(start_epoch, args.epochs):
+            train_loss, train_acc = train_one_epoch(model, wrapped_loader(train_loader), optimizer, criterion, device)
+            test_acc = evaluate(model, wrapped_loader(test_loader), device)
 
-        print(f"Epoch {epoch+1}/{args.epochs} - Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, Test Acc: {test_acc:.4f}")
+            print(f"Epoch {epoch+1}/{args.epochs} - Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, Test Acc: {test_acc:.4f}")
 
-        ckpt_state = {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "train_loss": train_loss,
-            "train_acc": train_acc,
-            "test_acc": test_acc,
-            "best_test_acc": best_test_acc,
-            "config": config,
-            "args": vars(args),
-        }
-        torch.save(ckpt_state, os.path.join(ckpt_dir, "latest.pt"))
+            ckpt_state = {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "train_loss": train_loss,
+                "train_acc": train_acc,
+                "test_acc": test_acc,
+                "best_test_acc": best_test_acc,
+                "config": config,
+                "args": vars(args),
+            }
+            torch.save(ckpt_state, os.path.join(ckpt_dir, "latest.pt"))
 
-        if test_acc > best_test_acc:
-            best_test_acc = test_acc
-            ckpt_state["best_test_acc"] = best_test_acc
-            torch.save(ckpt_state, os.path.join(ckpt_dir, "best.pt"))
-            print(f"New best test acc: {best_test_acc:.4f}, saved to {ckpt_dir}/best.pt")
+            if test_acc > best_test_acc:
+                best_test_acc = test_acc
+                ckpt_state["best_test_acc"] = best_test_acc
+                torch.save(ckpt_state, os.path.join(ckpt_dir, "best.pt"))
+                print(f"New best test acc: {best_test_acc:.4f}, saved to {ckpt_dir}/best.pt")
 
-    print(f"Training complete. Best test acc: {best_test_acc:.4f}")
+        print(f"Training complete. Best test acc: {best_test_acc:.4f}")
 
 if __name__ == "__main__":
     main()
