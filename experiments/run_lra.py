@@ -25,13 +25,18 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device):
     num_batches = 0
 
     pbar = tqdm(dataloader, desc="Training")
+    is_controller = getattr(model.backbone, "train_mode", "base") == "controller"
     for batch in pbar:
         inputs, labels = batch[0].to(device), batch[1].to(device)
         mask = batch[2].to(device) if len(batch) > 2 else None
-
         optimizer.zero_grad()
         outputs = model(inputs, mask=mask) if mask is not None else model(inputs)
-        loss = criterion(outputs, labels)
+        if is_controller and isinstance(outputs, tuple):
+            logits, K_soft = outputs
+            loss = criterion(logits, labels) + model.backbone.lambda_cost * K_soft.mean()
+            outputs = logits
+        else:
+            loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
 
@@ -73,7 +78,7 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW")
     parser.add_argument("--clip_grad", type=float, default=1.0, help="Gradient clipping norm")
-    parser.add_argument("--no_attd", action="store_true", help="Disable ATTD (pure Mamba)")
+    parser.add_argument("--no_attd", action="store_true"); parser.add_argument("--train_mode", type=str, default="base"); parser.add_argument("--inner_lr", type=float, default=0.1)
     parser.add_argument("--ckpt_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
 
@@ -99,7 +104,7 @@ def main():
         "expand": 2,
         "rank": 8,
         "k_max": 5 if not args.no_attd else 0,
-        "inner_lr": 0.1
+        "inner_lr": args.inner_lr, "train_mode": args.train_mode
     }
     
     backbone = build_attd_backbone(config)
@@ -113,7 +118,8 @@ def main():
         
     model.to(device)
     
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+    if args.train_mode == "controller": optimizer = optim.AdamW(model.backbone.controller.parameters(), lr=args.lr)
+    else: optimizer = optim.AdamW(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss()
 
     ckpt_dir = os.path.join(args.ckpt_dir, args.task)

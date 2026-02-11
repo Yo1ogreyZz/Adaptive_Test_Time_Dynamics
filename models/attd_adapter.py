@@ -22,13 +22,14 @@ class LowRankAdapter(nn.Module):
         self.V = nn.Parameter(torch.randn(rank, d_state, **factory_kwargs) * 0.1)
 
     def forward(self):
-        """Return delta_A of shape (d_inner, d_state)."""
+        """Return delta_A of shape (d_inner, d_state).""" 
         return torch.matmul(self.U, self.V)
 
     def reset_parameters(self):
         """Re-initialize for instance-specific adaptation (called per sample)."""
         nn.init.zeros_(self.U)
-        nn.init.normal_(self.V, std=0.1)
+        # We only reset U to ensure the priors.
+        # nn.init.normal_(self.V, std=0.1)
 
 
 class StabilityGate(nn.Module):
