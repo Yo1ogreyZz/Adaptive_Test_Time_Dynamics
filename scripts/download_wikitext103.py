@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Download WikiText-103 and export plain text splits to local directory.
+Download WikiText-103 (streaming) and export plain text splits to local directory.
 
 Usage:
+  export XXX
+  export XXX 
   python scripts/download_wikitext103.py \
       --output_dir data/wikitext103 \
       --dataset_config wikitext-103-raw-v1
@@ -19,16 +21,19 @@ import os
 from datasets import load_dataset
 
 
-def _split_to_text(ds_split):
-    lines = []
-    for x in ds_split["text"]:
-        if x is None:
-            continue
-        s = str(x)
-        if len(s) == 0:
-            continue
-        lines.append(s)
-    return "\n".join(lines)
+def write_split(ds_split, out_path):
+    n = 0
+    with open(out_path, "w", encoding="utf-8") as f:
+        for item in ds_split:
+            x = item.get("text", None)
+            if x is None:
+                continue
+            s = str(x)
+            if not s:
+                continue
+            f.write(s + "\n")
+            n += 1
+    return n
 
 
 def main():
@@ -36,7 +41,7 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="data/wikitext103",
+        default="XXX",
         help="Destination directory for train.txt/val.txt/test.txt",
     )
     parser.add_argument(
@@ -50,33 +55,29 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    print(f"Loading WikiText ({args.dataset_config}) from HuggingFace...")
-    train_ds = load_dataset("wikitext", args.dataset_config, split="train")
-    val_ds = load_dataset("wikitext", args.dataset_config, split="validation")
-    test_ds = load_dataset("wikitext", args.dataset_config, split="test")
-
-    print("Converting splits to plain text...")
-    train_txt = _split_to_text(train_ds)
-    val_txt = _split_to_text(val_ds)
-    test_txt = _split_to_text(test_ds)
+    print(f"Loading WikiText ({args.dataset_config}) from HuggingFace (streaming)...")
+    train_ds = load_dataset("wikitext", args.dataset_config, split="train", streaming=True)
+    val_ds = load_dataset("wikitext", args.dataset_config, split="validation", streaming=True)
+    test_ds = load_dataset("wikitext", args.dataset_config, split="test", streaming=True)
 
     train_path = os.path.join(args.output_dir, "train.txt")
     val_path = os.path.join(args.output_dir, "val.txt")
     test_path = os.path.join(args.output_dir, "test.txt")
 
-    with open(train_path, "w", encoding="utf-8") as f:
-        f.write(train_txt)
-    with open(val_path, "w", encoding="utf-8") as f:
-        f.write(val_txt)
-    with open(test_path, "w", encoding="utf-8") as f:
-        f.write(test_txt)
+    print("Writing splits to plain text (streaming)...")
+    n_train = write_split(train_ds, train_path)
+    print(f"  train: {n_train} lines -> {train_path}")
+    n_val = write_split(val_ds, val_path)
+    print(f"  val:   {n_val} lines -> {val_path}")
+    n_test = write_split(test_ds, test_path)
+    print(f"  test:  {n_test} lines -> {test_path}")
 
     meta = {
         "dataset": "wikitext",
         "config": args.dataset_config,
-        "num_train_rows": len(train_ds),
-        "num_val_rows": len(val_ds),
-        "num_test_rows": len(test_ds),
+        "num_train_rows": n_train,
+        "num_val_rows": n_val,
+        "num_test_rows": n_test,
         "files": {
             "train": train_path,
             "val": val_path,
@@ -89,9 +90,6 @@ def main():
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
     print("Done.")
-    print(f"Saved: {train_path}")
-    print(f"Saved: {val_path}")
-    print(f"Saved: {test_path}")
     print(f"Saved: {meta_path}")
 
 
