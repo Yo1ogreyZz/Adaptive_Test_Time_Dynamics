@@ -18,15 +18,31 @@ from tasks.listops import ListOpsTask, ListOpsModel
 from tasks.text_cls import TextClsTask, TextClsModel
 from tasks.pathfinder import PathfinderTask, PathfinderModel
 from tasks.lm_wikitext import WikiTextLMTask, WikiTextLMModel
+from tasks.qa_squad_v2 import SQuADv2Task, SQuADv2QAModel
 
+
+def _is_qa_output(logits, labels):
+    return isinstance(logits, (tuple, list)) and len(logits) == 2 and labels.dim() == 2 and labels.size(-1) == 2
 
 def _compute_ce_loss(logits, labels):
+    if _is_qa_output(logits, labels):
+        start_logits, end_logits = logits
+        start_labels = labels[:, 0]
+        end_labels = labels[:, 1]
+        return 0.5 * (F.cross_entropy(start_logits, start_labels) + F.cross_entropy(end_logits, end_labels))
     if logits.dim() == 3 and labels.dim() == 2:
         return F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1), ignore_index=0)
     return F.cross_entropy(logits, labels)
 
 
 def _compute_accuracy(logits, labels):
+    if _is_qa_output(logits, labels):
+        start_logits, end_logits = logits
+        start_preds = torch.argmax(start_logits, dim=-1)
+        end_preds = torch.argmax(end_logits, dim=-1)
+        exact = ((start_preds == labels[:, 0]) & (end_preds == labels[:, 1])).sum().item()
+        total = labels.size(0)
+        return exact, total
     if logits.dim() == 3 and labels.dim() == 2:
         preds = torch.argmax(logits, dim=-1)
         mask = (labels != 0)
@@ -36,6 +52,22 @@ def _compute_accuracy(logits, labels):
     preds = torch.argmax(logits, dim=-1)
     return (preds == labels).sum().item(), labels.size(0)
 
+def _compute_controller_target(logits, model):
+    if isinstance(logits, (tuple, list)) and len(logits) == 2:
+        start_logits, end_logits = logits
+        start_probs = F.softmax(start_logits, dim=-1)
+        end_probs = F.softmax(end_logits, dim=-1)
+        ent_start = -(start_probs * torch.log(start_probs.clamp_min(1e-8))).sum(dim=-1)
+        ent_end = -(end_probs * torch.log(end_probs.clamp_min(1e-8))).sum(dim=-1)
+        ent_norm = 0.5 * (
+            ent_start / math.log(start_logits.size(-1)) + ent_end / math.log(end_logits.size(-1))
+        )
+        return ent_norm * model.backbone.controller.k_max
+
+    probs = F.softmax(logits, dim=-1)
+    ent = -(probs * torch.log(probs.clamp_min(1e-8))).sum(dim=-1)
+    ent_norm = ent / math.log(logits.size(-1))
+    return ent_norm * model.backbone.controller.k_max
 
 def train_one_epoch(model, dataloader, optimizer, criterion, device, clip_grad=1.0):
     model.train()
@@ -56,16 +88,13 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, clip_grad=1
             ce_loss = _compute_ce_loss(logits, labels)
 
             with torch.no_grad():
-                probs = F.softmax(logits, dim=-1)
-                ent = -(probs * torch.log(probs.clamp_min(1e-8))).sum(dim=-1)
-                ent_norm = ent / math.log(logits.size(-1))
-                k_target = ent_norm * model.backbone.controller.k_max
+                k_target = _compute_controller_target(logits, model)
 
             ctrl_loss = F.mse_loss(K_soft.float(), k_target.float())
             loss = ce_loss + model.backbone.lambda_cost * K_soft.mean() + model.backbone.lambda_ctrl * ctrl_loss
             out_for_acc = logits
         else:
-            if isinstance(outputs, tuple):
+            if isinstance(outputs, tuple) and not _is_qa_output(outputs, labels):
                 outputs = outputs[0]
             loss = _compute_ce_loss(outputs, labels)
             out_for_acc = outputs
@@ -134,7 +163,7 @@ def evaluate(model, dataloader, device):
 def main():
     parser = argparse.ArgumentParser(description="Run LRA/ATTD tasks with Mamba")
 
-    parser.add_argument("--task", type=str, default="text", choices=["listops", "listops_small", "text", "pathfinder", "lm"])
+    parser.add_argument("--task", type=str, default="text", choices=["listops", "listops_small", "text", "pathfinder", "lm", "qa"])
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -163,6 +192,7 @@ def main():
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--block_size", type=int, default=256)
     parser.add_argument("--lm_dataset", type=str, default="wikitext-103-raw-v1")
+    parser.add_argument("--qa_dataset", type=str, default="rajpurkar/squad_v2")
     parser.add_argument("--num_workers", type=int, default=2)
 
     parser.add_argument("--ckpt_dir", type=str, default="checkpoints")
@@ -198,6 +228,14 @@ def main():
             dataset_name=args.lm_dataset,
             data_dir=args.data_dir,
             num_workers=args.num_workers,
+        )
+        vocab_size, num_classes = task_manager.vocab_size, task_manager.num_classes
+    elif args.task == "qa":
+        task_manager = SQuADv2Task(
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+            num_workers=args.num_workers,
+            dataset_id=args.qa_dataset,
         )
         vocab_size, num_classes = task_manager.vocab_size, task_manager.num_classes
     else:
@@ -242,6 +280,8 @@ def main():
         model = TextClsModel(backbone, vocab_size, args.d_model, num_classes)
     elif args.task == "lm":
         model = WikiTextLMModel(backbone, vocab_size, args.d_model)
+    elif args.task == "qa":
+        model = SQuADv2QAModel(backbone, vocab_size, args.d_model)
     else:
         model = PathfinderModel(backbone, args.d_model, num_classes)
 

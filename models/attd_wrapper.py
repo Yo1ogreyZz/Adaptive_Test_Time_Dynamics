@@ -103,6 +103,44 @@ class ATTDWrapper(nn.Module):
                 if per_sample:
                     return ent_per
                 return loss
+            
+            if self._task_head_mode == "token_qa":
+                qa_logits = self.task_head(out)
+                if isinstance(qa_logits, (tuple, list)):
+                    start_logits, end_logits = qa_logits
+                else:
+                    start_logits, end_logits = qa_logits[..., 0], qa_logits[..., 1]
+
+                start_probs = F.softmax(start_logits, dim=-1)
+                end_probs = F.softmax(end_logits, dim=-1)
+
+                start_ent = -(start_probs * torch.log(start_probs.clamp_min(1e-8))).sum(dim=-1)
+                end_ent = -(end_probs * torch.log(end_probs.clamp_min(1e-8))).sum(dim=-1)
+                ent_per = 0.5 * (start_ent + end_ent)
+
+                if ref_logits is not None and self.kl_weight > 0:
+                    if isinstance(ref_logits, (tuple, list)):
+                        ref_start, ref_end = ref_logits
+                    else:
+                        ref_start, ref_end = ref_logits[..., 0], ref_logits[..., 1]
+                    kl_start = F.kl_div(
+                        F.log_softmax(start_logits, dim=-1),
+                        F.softmax(ref_start, dim=-1),
+                        reduction="batchmean",
+                    )
+                    kl_end = F.kl_div(
+                        F.log_softmax(end_logits, dim=-1),
+                        F.softmax(ref_end, dim=-1),
+                        reduction="batchmean",
+                    )
+                    kl = 0.5 * (kl_start + kl_end)
+                else:
+                    kl = 0.0
+
+                loss = self.entropy_weight * ent_per.mean() + self.kl_weight * kl
+                if per_sample:
+                    return ent_per
+                return loss
 
             pooled = out.mean(dim=1)
             logits = self.task_head(pooled)
@@ -140,7 +178,7 @@ class ATTDWrapper(nn.Module):
         if self.task_head is not None:
             with torch.no_grad():
                 out_base = self.backbone(x_orig, delta_As=None)
-                if self._task_head_mode == "token_lm":
+                if self._task_head_mode in ("token_lm", "token_qa"):
                     ref_logits = self.task_head(out_base)
                 else:
                     ref_logits = self.task_head(out_base.mean(dim=1))
