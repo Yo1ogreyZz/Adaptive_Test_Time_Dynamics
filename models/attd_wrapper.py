@@ -120,15 +120,13 @@ class ATTDWrapper(nn.Module):
     def _decide_k_dyn(self, s):
         out = self.controller(s)
         if isinstance(out, (tuple, list)):
-            K_soft, K_hard = out[0], out[1]
-            # Use ceil(mean(K_soft)) instead of round(mean(K_hard)) to avoid collapsing to 0
-            k_dyn = int(torch.ceil(K_soft.float().mean()).item())
-            k_dyn = max(0, min(k_dyn, self.controller.k_max))
-            return k_dyn, K_soft
+            K_soft = out[0].float()
         else:
-            k_dyn = int(torch.ceil(out.float().mean()).item())
-            k_dyn = max(0, min(k_dyn, self.controller.k_max))
-            return k_dyn, out
+            K_soft = out.float()
+
+        # avoids dynamic-compute collapse and preserves input-wise difficulty allocation.
+        k_each = torch.ceil(K_soft).long().clamp_(0, self.controller.k_max)
+        return k_each, K_soft
 
     def inner_loop_adapt(self, x, k_dyn: int):
         if k_dyn <= 0:
@@ -177,23 +175,55 @@ class ATTDWrapper(nn.Module):
 
         return [adapter().detach() for adapter in self.adapters]
 
+    def _forward_samplewise_k(self, x, k_each):
+       
+        k_each = k_each.to(device=x.device)
+        unique_k = torch.unique(k_each, sorted=True)
+        out_full = None
+
+        for k_val in unique_k.tolist():
+            idx = torch.nonzero(k_each == k_val, as_tuple=False).squeeze(-1)
+            if idx.numel() == 0:
+                continue
+            x_sub = x.index_select(0, idx)
+
+            if k_val <= 0:
+                with torch.no_grad():
+                    out_sub = self.backbone(x_sub, delta_As=None)
+            else:
+                self._reset_adapters()
+                delta_As = self.inner_loop_adapt(x_sub, int(k_val))
+                with torch.no_grad():
+                    out_sub = self.backbone(x_sub, delta_As=delta_As)
+
+            if out_full is None:
+                out_full = torch.empty(
+                    x.size(0), out_sub.size(1), out_sub.size(2), device=out_sub.device, dtype=out_sub.dtype
+                )
+            out_full.index_copy_(0, idx, out_sub)
+
+        if out_full is None:
+            out_full = self.backbone(x, delta_As=None)
+        return out_full
+
     def forward(self, x, return_info: bool = False):
         if self.training and self.train_mode != "controller":
             out = self.backbone(x)
             if return_info:
-                return out, {"k_dyn": 0, "K_soft": torch.zeros(x.size(0), device=x.device)}
+                # return tensor k_dyn to unify downstream aggregation.
+                return out, {
+                    "k_dyn": torch.zeros(x.size(0), dtype=torch.long, device=x.device),
+                    "K_soft": torch.zeros(x.size(0), device=x.device),
+                }
             return out
 
         if self.training and self.train_mode == "controller":
             with torch.no_grad():
                 s_vec = self.compute_internal_loss(x, delta_As=None, per_sample=True)
-            k_dyn, K_soft = self._decide_k_dyn(s_vec)
+            k_each, K_soft = self._decide_k_dyn(s_vec)
+            out = self._forward_samplewise_k(x, k_each)
 
-            self._reset_adapters()
-            delta_As = self.inner_loop_adapt(x, k_dyn)
-            out = self.backbone(x, delta_As=delta_As)
-
-            info = {"s": float(s_vec.mean().item()), "k_dyn": int(k_dyn), "K_soft": K_soft}
+            info = {"s": float(s_vec.mean().item()), "k_dyn": k_each, "K_soft": K_soft}
             if return_info:
                 return out, info
             return out
@@ -202,35 +232,28 @@ class ATTDWrapper(nn.Module):
         if getattr(self, "disable_attd", False):
             out = self.backbone(x)
             if return_info:
-                return out, {"s": 0.0, "k_dyn": 0, "K_soft": torch.zeros(x.size(0), device=x.device)}
+                return out, {
+                    "s": 0.0,
+                    "k_dyn": torch.zeros(x.size(0), dtype=torch.long, device=x.device),
+                    "K_soft": torch.zeros(x.size(0), device=x.device),
+                }
             return out
-
-        self._reset_adapters()
 
         with torch.no_grad():
             s_vec = self.compute_internal_loss(x, delta_As=None, per_sample=True)
 
         if self.train_mode == "base":
-            k_dyn = self.controller.k_max
-            K_soft = torch.full((x.size(0),), float(k_dyn), device=x.device)
+            k_each = torch.full((x.size(0),), int(self.controller.k_max), dtype=torch.long, device=x.device)
+            K_soft = k_each.float()
         else:
-            k_dyn, K_soft = self._decide_k_dyn(s_vec)
+            k_each, K_soft = self._decide_k_dyn(s_vec)
 
-        # Fast path for k=0: no adaptation steps
-        if k_dyn <= 0:
-            out = self.backbone(x, delta_As=None)
-            if return_info:
-                return out, {"s": float(s_vec.mean().item()), "k_dyn": 0, "K_soft": K_soft}
-            return out
-
-        delta_As = self.inner_loop_adapt(x, k_dyn)
-        with torch.no_grad():
-            out = self.backbone(x, delta_As=delta_As)
+        out = self._forward_samplewise_k(x, k_each)
 
         if out is None:
             out = self.backbone(x, delta_As=None)
 
-        info = {"s": float(s_vec.mean().item()), "k_dyn": int(k_dyn), "K_soft": K_soft}
+        info = {"s": float(s_vec.mean().item()), "k_dyn": k_each, "K_soft": K_soft}
         if return_info:
             return out, info
         return out

@@ -36,6 +36,18 @@ def _compute_accuracy(logits, labels):
     preds = torch.argmax(logits, dim=-1)
     return (preds == labels).sum().item(), labels.size(0)
 
+def _compute_lm_ce_stats(logits, labels):
+    if logits.dim() != 3 or labels.dim() != 2:
+        return None
+    log_probs = F.log_softmax(logits, dim=-1)
+    nll = -torch.gather(log_probs, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+    mask = (labels != 0).float()
+    token_count = mask.sum().item()
+    if token_count <= 0:
+        return 0.0, 0
+    ce_sum = (nll * mask).sum().item()
+    return ce_sum, int(token_count)
+
 
 def train_one_epoch(model, dataloader, optimizer, criterion, device, clip_grad=1.0):
     model.train()
@@ -58,6 +70,10 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, clip_grad=1
             with torch.no_grad():
                 probs = F.softmax(logits, dim=-1)
                 ent = -(probs * torch.log(probs.clamp_min(1e-8))).sum(dim=-1)
+                # reduce entropy across non-batch dims for token LM logits [B, L, V].
+                if ent.dim() > 1:
+                    ent = ent.mean(dim=tuple(range(1, ent.dim())))
+
                 ent_norm = ent / math.log(logits.size(-1))
                 k_target = ent_norm * model.backbone.controller.k_max
 
@@ -92,6 +108,8 @@ def evaluate(model, dataloader, device):
 
     k_soft_all = []
     k_hard_all = []
+    lm_ce_sum = 0.0
+    lm_token_count = 0
 
     for batch in tqdm(dataloader, desc="Evaluating", miniters=10):
         inputs, labels = batch[0].to(device), batch[1].to(device)
@@ -109,13 +127,25 @@ def evaluate(model, dataloader, device):
         correct += c
         total += t
 
+        lm_stats = _compute_lm_ce_stats(logits, labels)
+        if lm_stats is not None:
+            ce_sum, tok_count = lm_stats
+            lm_ce_sum += ce_sum
+            lm_token_count += tok_count
+
         if isinstance(info, dict):
             if "K_soft" in info and info["K_soft"] is not None:
                 k_soft = info["K_soft"]
                 if isinstance(k_soft, torch.Tensor):
                     k_soft_all.append(k_soft.detach().float().cpu())
+
             if "k_dyn" in info:
-                k_hard_all.append(float(info["k_dyn"]))
+                k_dyn = info["k_dyn"]
+                # support scalar or tensor k_dyn.
+                if isinstance(k_dyn, torch.Tensor):
+                    k_hard_all.append(k_dyn.detach().float().cpu().reshape(-1))
+                else:
+                    k_hard_all.append(torch.tensor([float(k_dyn)], dtype=torch.float32))
 
     acc = correct / max(total, 1)
 
@@ -124,9 +154,16 @@ def evaluate(model, dataloader, device):
         k_soft_cat = torch.cat(k_soft_all)
         stats["avg_k_soft"] = float(k_soft_cat.mean().item())
         stats["p90_k_soft"] = float(torch.quantile(k_soft_cat, 0.9).item())
+
     if len(k_hard_all) > 0:
-        k_hard_t = torch.tensor(k_hard_all, dtype=torch.float32)
+        k_hard_t = torch.cat(k_hard_all)
         stats["avg_k_hard"] = float(k_hard_t.mean().item())
+
+    # compute token ce and perplexity for LM.
+    if lm_token_count > 0:
+        token_ce = lm_ce_sum / lm_token_count
+        stats["token_ce"] = float(token_ce)
+        stats["ppl"] = float(math.exp(min(token_ce, 20.0)))
 
     return acc, stats
 
@@ -165,6 +202,9 @@ def main():
     parser.add_argument("--lm_dataset", type=str, default="wikitext-103-raw-v1")
     parser.add_argument("--num_workers", type=int, default=2)
 
+    parser.add_argument("--max_train_samples", type=int, default=None, help="Max number of train samples (LM task only)")
+    parser.add_argument("--data_fraction", type=float, default=None, help="Fraction of train data to use, e.g. 0.2 (LM task only)")
+
     parser.add_argument("--ckpt_dir", type=str, default="checkpoints")
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--resume_weights_only", action="store_true")
@@ -198,6 +238,8 @@ def main():
             dataset_name=args.lm_dataset,
             data_dir=args.data_dir,
             num_workers=args.num_workers,
+            max_train_samples=args.max_train_samples,
+            data_fraction=args.data_fraction,
         )
         vocab_size, num_classes = task_manager.vocab_size, task_manager.num_classes
     else:
@@ -253,7 +295,7 @@ def main():
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     criterion = nn.CrossEntropyLoss()
-    ckpt_dir = os.path.join(args.ckpt_dir, args.task)
+    ckpt_dir = args.ckpt_dir
     os.makedirs(ckpt_dir, exist_ok=True)
 
     start_epoch = 0
@@ -303,7 +345,9 @@ def main():
             f"Test Acc: {test_acc:.4f}, "
             f"avg_k_soft: {test_stats.get('avg_k_soft', -1):.3f}, "
             f"p90_k_soft: {test_stats.get('p90_k_soft', -1):.3f}, "
-            f"avg_k_hard: {test_stats.get('avg_k_hard', -1):.3f}"
+            f"avg_k_hard: {test_stats.get('avg_k_hard', -1):.3f}, "
+            f"token_ce: {test_stats.get('token_ce', -1):.4f}, "
+            f"ppl: {test_stats.get('ppl', -1):.3f}"
         )
         return
 
@@ -319,7 +363,9 @@ def main():
             f"Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}, "
             f"avg_k_soft: {val_stats.get('avg_k_soft', -1):.3f}, "
             f"p90_k_soft: {val_stats.get('p90_k_soft', -1):.3f}, "
-            f"avg_k_hard: {val_stats.get('avg_k_hard', -1):.3f}"
+            f"avg_k_hard: {val_stats.get('avg_k_hard', -1):.3f}, "
+            f"token_ce: {val_stats.get('token_ce', -1):.4f}, "
+            f"ppl: {val_stats.get('ppl', -1):.3f}"
         )
 
         ckpt_state = {
@@ -351,7 +397,9 @@ def main():
         f"Final Test Acc (selected by val): {final_test_acc:.4f}, "
         f"avg_k_soft: {test_stats.get('avg_k_soft', -1):.3f}, "
         f"p90_k_soft: {test_stats.get('p90_k_soft', -1):.3f}, "
-        f"avg_k_hard: {test_stats.get('avg_k_hard', -1):.3f}"
+        f"avg_k_hard: {test_stats.get('avg_k_hard', -1):.3f}, "
+        f"token_ce: {test_stats.get('token_ce', -1):.4f}, "
+        f"ppl: {test_stats.get('ppl', -1):.3f}"
     )
     print(f"Training complete. Best val acc: {best_val_acc:.4f}")
 

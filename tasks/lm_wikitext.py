@@ -25,7 +25,7 @@ class TokenBlockDataset(Dataset):
         return len(self.inputs)
 
     def __getitem__(self, idx):
-        return self.inputs[idx], self.labels[idx]
+        return torch.tensor(self.inputs[idx], dtype=torch.long), torch.tensor(self.labels[idx], dtype=torch.long)
 
 
 class WikiTextLMTask:
@@ -34,13 +34,16 @@ class WikiTextLMTask:
     Returns batches for next-token prediction.
     """
 
-    def __init__(self, batch_size=16, block_size=256, dataset_name="wikitext-103-raw-v1", data_dir=None, num_workers=2):
+    def __init__(self, batch_size=16, block_size=256, dataset_name="wikitext-103-raw-v1", data_dir=None, num_workers=2,
+                 max_train_samples=None, data_fraction=None):
         self.task_name = "lm"
         self.batch_size = batch_size
         self.block_size = block_size
         self.dataset_name = dataset_name
         self.data_dir = data_dir
         self.num_workers = num_workers
+        self.max_train_samples = max_train_samples
+        self.data_fraction = data_fraction
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.vocab_size = 257
         self.num_classes = self.vocab_size
@@ -72,7 +75,22 @@ class WikiTextLMTask:
     def _build_split(self, split: str):
         text = self._load_split_text(split)
         token_ids = self._encode_text(text)
-        return TokenBlockDataset(token_ids, self.block_size)
+        ds = TokenBlockDataset(token_ids, self.block_size)
+
+        if split == "train":
+            n = len(ds)
+            limit = n
+            if self.data_fraction is not None:
+                limit = min(limit, int(n * self.data_fraction))
+            if self.max_train_samples is not None:
+                limit = min(limit, self.max_train_samples)
+            if limit < n:
+                ds.inputs = ds.inputs[:limit]
+                ds.labels = ds.labels[:limit]
+                print(f"[WikiTextLMTask] train subset: {limit}/{n} samples "
+                      f"(fraction={self.data_fraction}, max={self.max_train_samples})")
+
+        return ds
 
     def get_dataloader(self, split="train"):
         if split not in self._datasets:
