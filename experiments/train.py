@@ -307,6 +307,11 @@ def main():
         if args.train_mode == "controller":
             state = {k: v for k, v in state.items() if not k.startswith("backbone.controller.")}
 
+        # Drop keys whose shapes don't match (e.g. delta_raw when k_max differs)
+        model_state = model.state_dict()
+        state = {k: v for k, v in state.items()
+                 if k not in model_state or v.shape == model_state[k].shape}
+
         missing, unexpected = model.load_state_dict(state, strict=False)
         print(f"load_state_dict(strict=False): missing={len(missing)}, unexpected={len(unexpected)}")
 
