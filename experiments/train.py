@@ -194,6 +194,7 @@ def main():
     parser.add_argument("--confidence_tau", type=float, default=0.0)
     parser.add_argument("--adapter_grad_clip", type=float, default=1.0)
     parser.add_argument("--max_delta_norm", type=float, default=0.5)
+    parser.add_argument("--use_stability_gate", action="store_true")
 
     parser.add_argument("--text_dataset", type=str, default="agnews", choices=["agnews", "imdb"])
     parser.add_argument("--data_dir", type=str, default="data/agnews")
@@ -263,6 +264,7 @@ def main():
         "confidence_tau": args.confidence_tau,
         "adapter_grad_clip": args.adapter_grad_clip,
         "max_delta_norm": args.max_delta_norm,
+        "use_stability_gate": args.use_stability_gate,
     }
 
     ckpt = None
@@ -290,7 +292,10 @@ def main():
     model.to(device)
 
     if args.train_mode == "controller":
-        optimizer = optim.AdamW(model.backbone.controller.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        opt_params = list(model.backbone.controller.parameters())
+        if args.use_stability_gate:
+            opt_params += list(model.backbone.stability_gate.parameters())
+        optimizer = optim.AdamW(opt_params, lr=args.lr, weight_decay=args.weight_decay)
     else:
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 

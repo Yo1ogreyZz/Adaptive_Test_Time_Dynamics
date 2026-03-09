@@ -28,6 +28,7 @@ class ATTDWrapper(nn.Module):
             k_max=config.get("k_max", 5),
             tau=config.get("tau", 0.1),
         )
+        self.use_stability_gate = config.get("use_stability_gate", False)
         self.stability_gate = StabilityGate()
 
         self.inner_lr = config.get("inner_lr", 1e-3)
@@ -160,7 +161,11 @@ class ATTDWrapper(nn.Module):
 
                 torch.nn.utils.clip_grad_norm_(adapter_params, self.adapter_grad_clip)
 
-                gamma = self.stability_gate(loss.detach()).mean().clamp(0.0, 1.0)
+                if self.use_stability_gate:
+                    gamma = self.stability_gate(loss.detach()).mean().clamp(0.0, 1.0)
+                else:
+                    gamma = torch.tensor(1.0, device=loss.device)
+                
                 with torch.no_grad():
                     for group in inner_optimizer.param_groups:
                         lr = group["lr"]
